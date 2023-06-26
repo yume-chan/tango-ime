@@ -1,161 +1,141 @@
 package com.npes87184.socket.ime;
 
+import android.graphics.Rect;
 import android.inputmethodservice.InputMethodService;
 import android.net.LocalServerSocket;
 import android.net.LocalSocket;
+import android.net.LocalSocketAddress;
+import android.os.Build;
 import android.util.Log;
 import android.view.KeyEvent;
 import android.view.View;
+import android.view.inputmethod.CursorAnchorInfo;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
 import android.widget.Button;
 
+import java.io.BufferedWriter;
+import java.io.DataOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.OutputStreamWriter;
+import java.nio.charset.StandardCharsets;
 
 import static java.lang.Thread.interrupted;
 
 public class SocketIME extends InputMethodService {
 
-    private LocalServerSocket mLocalSocketServer = null;
     private LocalSocket mLocalSocket = null;
+    private OutputStream mOutputStream = null;
+    private DataOutputStream mWriter = null;
     private Thread mThread = null;
     private static final String SOCKET_NAME = "socket-ime";
-    private final String SOCKET_IME = "SocketIME";
-    private Button mBtnConnect;
-    private Button mBtnClose;
 
     @Override
-    public View onCreateInputView() {
-        View mInputView = getLayoutInflater().inflate(R.layout.view, null);
-        mThread = new Thread(new Runnable() {
-            @Override
-            public void run() {
-                listenSocket();
+    public void onCreate() {
+        if (mThread != null && mThread.isAlive()) {
+            mThread.interrupt();
+        }
+        mThread = new Thread(() -> {
+            mLocalSocket = new LocalSocket();
+
+            try {
+                mLocalSocket.connect(new LocalSocketAddress(SOCKET_NAME), 1000);
+
+                mOutputStream = mLocalSocket.getOutputStream();
+                mWriter = new DataOutputStream(mOutputStream);
+
+                var inputStream = mLocalSocket.getInputStream();
+
+
+                var buffer = new byte[1024];
+                while (true) {
+                    var read = inputStream.read(buffer);
+                    if (read < 0) {
+                        throw new IOException("");
+                    }
+
+                    var string = new String(buffer, 0, read, StandardCharsets.UTF_8);
+                    getCurrentInputConnection().commitText(string, 1);
+                }
+            } catch (Exception ignored) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    switchToNextInputMethod(false);
+                }
             }
         });
-
-        mBtnConnect = mInputView.findViewById(R.id.buttonConnect);
-        mBtnConnect.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                startService();
-            }
-        });
-
-        mBtnClose = mInputView.findViewById(R.id.buttonClose);
-        mBtnClose.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                stopService();
-            }
-        });
-
-        startService();
-
-        return mInputView;
     }
 
     @Override
     public void onDestroy() {
         super.onDestroy();
+
+        if (mThread != null && mThread.isAlive()) {
+            mThread.interrupt();
+            mThread = null;
+        }
+
+        try {
+            if (mLocalSocket != null) {
+                mLocalSocket.close();
+                mLocalSocket = null;
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private static final int MESSAGE_TYPE_START = 0;
+    private static final int MESSAGE_TYPE_UPDATE_CURSOR = 1;
+    private static final int MESSAGE_TYPE_STOP = 2;
+
+    @Override
+    public void onStartInput(EditorInfo info, boolean restarting) {
+        try {
+            if (mWriter != null) {
+                mWriter.writeInt(MESSAGE_TYPE_START);
+                mWriter.writeInt(info.inputType);
+
+                CharSequence initialSelectedText = null;
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    initialSelectedText = info.getInitialSelectedText(0);
+                }
+                if (initialSelectedText != null) {
+                    var buffer = initialSelectedText.toString().getBytes(StandardCharsets.UTF_8);
+                    mWriter.writeInt(buffer.length);
+                    mWriter.write(buffer, 0, buffer.length);
+                }
+
+                getCurrentInputConnection().requestCursorUpdates(InputConnection.CURSOR_UPDATE_IMMEDIATE | InputConnection.CURSOR_UPDATE_MONITOR);
+            }
+        } catch (Exception ignored) {
+        }
     }
 
     @Override
-    public void onStartInputView(EditorInfo info, boolean restarting) {
-        if (mThread.isAlive()) {
-            mBtnClose.setEnabled(true);
-            mBtnConnect.setEnabled(false);
-        } else {
-            mBtnClose.setEnabled(false);
-            mBtnConnect.setEnabled(true);
-        }
-    }
-
-    private void startService() {
-        if (!mThread.isAlive() && !mThread.isInterrupted()) {
-            startListenSocket();
-            mBtnClose.setEnabled(true);
-            mBtnConnect.setEnabled(false);
-        }
-    }
-
-    private void stopService() {
-        if (mThread.isAlive()) {
-            // mark thread as interrupted
-            mThread.interrupt();
-            Log.i(SOCKET_IME, "Interrupted thread");
-
-            // now send connect request to myself to trigger leaving accept()
-            LocalSocket ls = new LocalSocket();
-            try {
-                ls.connect(mLocalSocketServer.getLocalSocketAddress());
-                ls.close();
-            } catch (Exception e) {
-
-            }
-            Log.i(SOCKET_IME, "Leave accept");
-
-            try {
-                mLocalSocketServer.close();
-                mLocalSocket.shutdownInput();
-                mLocalSocket.close();
-                Log.i(SOCKET_IME, "Close server socket");
-            } catch (Exception e) {
-
-            }
-
-            mBtnClose.setEnabled(false);
-            mBtnConnect.setEnabled(true);
-        }
-    }
-
-    private void startListenSocket() {
-        mThread.start();
-    }
-
-    private void listenSocket() {
-        String msg;
-
-        Log.i(SOCKET_IME, "Thread started");
+    public void onUpdateCursorAnchorInfo(CursorAnchorInfo cursorAnchorInfo) {
         try {
-            mLocalSocketServer = new LocalServerSocket(SOCKET_NAME);
-            Log.i(SOCKET_IME, "Server created");
-            mLocalSocket = mLocalSocketServer.accept();
-            Log.i(SOCKET_IME, "Client connected");
-        } catch (Exception e) {
-            Log.i(SOCKET_IME, "Failed to create server");
-        }
-
-        while (!interrupted()) {
-            msg = getMsgFromSocket();
-            InputConnection ic = getCurrentInputConnection();
-            if (ic != null) {
-                ic.commitText(msg, 1);
-                ic.sendKeyEvent(new KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_ENTER));
-                ic.sendKeyEvent(new KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_ENTER));
+            if (mWriter != null) {
+                mWriter.writeInt(MESSAGE_TYPE_UPDATE_CURSOR);
+                var selectionStart = cursorAnchorInfo.getSelectionStart();
+                var rect = cursorAnchorInfo.getCharacterBounds(selectionStart);
+                mWriter.writeInt((int) rect.top);
+                mWriter.writeInt((int) rect.bottom);
+                mWriter.writeInt((int) rect.left);
+                mWriter.writeInt((int) rect.right);
             }
+        } catch (Exception ignored) {
         }
-
-        Log.i(SOCKET_IME, "Thread stopped");
     }
 
-    private String getMsgFromSocket() {
-        String msg = "";
-        int readLen;
-        byte[] buffer = new byte[4096];
-
+    @Override
+    public void onFinishInput() {
+        super.onFinishInput();
         try {
-            InputStream is = mLocalSocket.getInputStream();
-
-            if ((readLen = is.read(buffer, 0, 4096)) != -1) {
-                msg = new String(buffer, 0, readLen);
-                Log.i(SOCKET_IME, msg);
+            if (mWriter != null) {
+                mWriter.writeInt(MESSAGE_TYPE_STOP);
             }
-        } catch (Exception e) {
-            Log.i(SOCKET_IME, "Exception");
-            return "";
+        } catch (Exception ignored) {
         }
-
-        return msg;
     }
 }
